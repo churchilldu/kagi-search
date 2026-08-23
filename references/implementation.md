@@ -58,7 +58,7 @@ Cache-Control: no-cache
 Returns up to ~60 items per stream (page-1 volume), so `-n`/`--offset` slice
 locally — pagination needs no extra request.
 
-## Cookie source
+## Cookie source + caching
 
 - LibreWolf stores cookies in `%APPDATA%\librewolf\Profiles\<profile>\cookies.sqlite`.
 - Active profile resolved from `%APPDATA%\librewolf\profiles.ini` (prefers the
@@ -67,6 +67,25 @@ locally — pagination needs no extra request.
 - Read via `sqlite3.connect("file:...?mode=ro")` — profile is never modified,
   even if LibreWolf is running.
 - Cookies are plaintext; no key4 decryption needed for cookie values.
+
+### Cache (`<skill dir>/.kagi_cache.json`)
+
+The Kagi cookies (`kagi_session`, `_kagi_search_`, `kagi_previous_page`) are
+cached to a JSON file in the skill dir to avoid scanning the profile every run:
+
+- `read_cookie_cache()` returns the cached `{name:value}` map only if
+  `expires_at` > now (or the file does not exist) — else `{}`.
+- `load_cookies(profiles, use_cache)` → cache hit, or fall back to
+  `_sqlite_cookies()` and `write_cookie_cache()`.
+- `expires_at` derives from `moz_cookies.expiry` (ms→s); when the cookie has no
+  real expiry (session cookie → `expiry == 0`), falls back to
+  `DEFAULT_TTL_SECONDS` (6 h).
+- The warm-up `/search` response's fresh `Set-Cookie` values are written back
+  to the cache each run, so the cached session stays current.
+- `--no-cache` bypasses the cache (force profile read). Cache writes are
+  best-effort and atomic (`os.replace` of a `.tmp`), and the file is
+  git-ignored because it holds a session secret. Override the path with
+  `KAGI_CACHE_FILE`.
 
 ## Why not the earlier headless-browser version?
 

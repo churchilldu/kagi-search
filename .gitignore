@@ -4,5 +4,7 @@ __pycache__/
 *.html
 *.tmp
 *.har
+.kagi_cache.json
+.kagi_cache.json.tmp
 .venv/
 venv/

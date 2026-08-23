@@ -22,12 +22,18 @@ import re
 import secrets
 import sqlite3
 import sys
+import time
 import urllib.parse
 import urllib.request
 
 DOMAIN = "kagi.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 "
       "Firefox/153.0")
+CACHE_FILENAME = ".kagi_cache.json"
+# When the stored cookie has no real expiry (0 / session cookie), fall back to
+# this TTL and re-fetch from the profile after it passes.
+DEFAULT_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+CACHE_KEYS = ("kagi_session", "_kagi_search_", "kagi_previous_page")
 
 
 class KagiError(Exception):
@@ -74,9 +80,48 @@ def profile_candidates() -> list:
     return out
 
 
-def load_cookies(profiles: list) -> dict:
-    """Return the Kagi cookies {name:(value,domain,path)} from a profile with
-    a valid session, or raise KagiError."""
+def skill_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def cache_file() -> str:
+    return os.environ.get("KAGI_CACHE_FILE") or os.path.join(skill_dir(), CACHE_FILENAME)
+
+
+def read_cookie_cache(now: float = None) -> dict:
+    """Return {name:value,...} from the cache file if un-expired, else {}."""
+    now = time.time() if now is None else now
+    try:
+        with open(cache_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict) or not data.get("kagi_session"):
+        return {}
+    exp = data.get("expires_at") or 0
+    if exp > now:
+        return {k: data[k] for k in CACHE_KEYS if data.get(k)}
+    return {}
+
+
+def write_cookie_cache(cookies: dict, expires_at: float) -> None:
+    try:
+        payload = {k: v for k, v in cookies.items() if k in CACHE_KEYS and v}
+        payload["expires_at"] = expires_at or time.time() + DEFAULT_TTL_SECONDS
+        payload["fetched_at"] = time.time()
+        tmp = cache_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, cache_file())
+    except Exception:
+        pass  # cache is best-effort; never block the search
+
+
+def _sqlite_cookies(profiles: list):
+    """Read Kagi cookies from a LibreWolf profile.
+
+    Returns (cookies_dict, kagi_session_expiry_sec) where cookies_dict maps
+    cookie name -> value. Returns ({}, None) when no valid session is found."""
     for profile in profiles:
         db = os.path.join(profile, "cookies.sqlite")
         if not os.path.exists(db):
@@ -87,21 +132,40 @@ def load_cookies(profiles: list) -> dict:
             continue
         try:
             rows = con.execute(
-                "SELECT host,name,value,path FROM moz_cookies "
-                "WHERE host LIKE '%kagi.com' and name='kagi_session' "
-                "   OR host LIKE '%kagi.com' and name like '_kagi_%' "
-                "   OR host LIKE '%kagi.com' and name='kagi_previous_page' "
-                "   OR host LIKE '%kagi.com' and name like 'kagi_%'"
+                "SELECT name,value,expiry FROM moz_cookies "
+                "WHERE host LIKE '%kagi.com' AND name IN "
+                "('kagi_session','_kagi_search_','kagi_previous_page')"
             ).fetchall()
             cookies = {}
-            for host, name, value, path in rows:
-                if name not in cookies and len(value or "") > 0:
-                    cookies[name] = (value, host, path)
+            expiry = None
+            for name, value, exp in rows:
+                if len(value or "") == 0:
+                    continue
+                if name not in cookies:
+                    cookies[name] = value
+                    if name == "kagi_session":
+                        # moz_cookies.expiry is ms since epoch
+                        expiry = (exp or 0) / 1000.0 if exp else None
             if cookies.get("kagi_session"):
-                return cookies
+                return cookies, expiry
         finally:
             con.close()
-    return {}
+    return {}, None
+
+
+def load_cookies(profiles: list, use_cache: bool = True) -> dict:
+    """Return the Kagi cookies {name:value,...} for a valid session.
+
+    Uses the on-disk cache file first; only reads the profile (and refreshes the
+    cache) when the cache is missing or expired. Never raise when cache breaks."""
+    if use_cache:
+        cached = read_cookie_cache()
+        if cached:
+            return cached
+    cookies, expiry = _sqlite_cookies(profiles)
+    if cookies:
+        write_cookie_cache(cookies, expiry)
+    return cookies
 
 
 # --------------------------------------------------------------------------- #
@@ -204,16 +268,17 @@ def parse_related(html: str):
     return [strip_html(s) for s in spans if strip_html(s)]
 
 
-def run_search(query: str, limit: int, lens: str, with_related: bool) -> dict:
-    cookies = load_cookies(profile_candidates())
+def run_search(query: str, limit: int, lens: str, with_related: bool,
+               use_cache: bool = True) -> dict:
+    cookies = load_cookies(profile_candidates(), use_cache=use_cache)
     if not cookies:
         raise KagiError(
             "No LibreWolf profile with a Kagi login found.\n"
             "  - Log in at https://kagi.com in LibreWolf, then retry.\n"
             "  - Or set KAGI_PROFILE to the profile dir holding your Kagi cookies."
         )
-    session = cookies["kagi_session"][0]
-    old_search = cookies.get("_kagi_search_", ("", None, None))[0]
+    session = cookies["kagi_session"]
+    old_search = cookies.get("_kagi_search_", "")
     base_cookie = f"kagi_session={session}"
     if old_search:
         base_cookie = f"_kagi_search_={old_search}; {base_cookie}"
@@ -228,6 +293,9 @@ def run_search(query: str, limit: int, lens: str, with_related: bool) -> dict:
         cookie_now = f"_kagi_search_={now_search}; {cookie_now}"
     # prefer refreshed session if the server issued one
     session = now
+    # persist refreshed cookies back to the cache so it stays current
+    if use_cache and now and now != cookies.get("kagi_session"):
+        write_cookie_cache({"kagi_session": now, "_kagi_search_": now_search}, 0)
 
     # 2) SSE results
     stream = fetch_socket(query, lens, cookie_now, session)
@@ -307,6 +375,8 @@ def main():
     ap.add_argument("--json", action="store_true", help="output JSON")
     ap.add_argument("--no-related", action="store_true", help="hide related searches")
     ap.add_argument("--no-quick", action="store_true", help="omit the quick answer block")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="ignore the cached cookie and re-read the LibreWolf profile")
     args = ap.parse_args()
     if not args.query:
         ap.print_help()
@@ -315,7 +385,8 @@ def main():
     with_related = not args.no_related
     with_quick = not args.no_quick
     try:
-        data = run_search(args.query, args.offset + args.limit, args.lens, with_related)
+        data = run_search(args.query, args.offset + args.limit, args.lens,
+                          with_related, use_cache=not args.no_cache)
         data["results"] = data["results"][args.offset:]
     except KagiError as e:
         print(f"error: {e}", file=sys.stderr)

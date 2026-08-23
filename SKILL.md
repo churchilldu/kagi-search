@@ -38,15 +38,26 @@ python search.py "query" --lens code            # Kagi lens (code, videos, news,
 python search.py "query" --json                 # machine-readable output
 python search.py "query" --no-quick             # omit AI quick answer
 python search.py "query" --no-related           # hide related searches
+python search.py "query" --no-cache             # ignore cached cookie, re-read profile
 ```
 
 From pi, invoke it through this skill (the agent runs `search.py` for you).
+
+## Cookie caching
+
+The Kagi session cookie is cached to `.kagi_cache.json` in the skill directory.
+On each run the cache is used if it exists and hasn't expired; otherwise the
+session is re-read from your LibreWolf profile and the cache is refreshed.
+Cached cookies are re-validated/rotated by the warm-up `/search` request every
+run, and `--no-cache` forces a fresh profile read. (Cache file is git-ignored
+— it contains a session secret.)
 
 ## Environment overrides
 
 | Variable | Meaning |
 |----------|---------|
 | `KAGI_PROFILE` | Path to the LibreWolf profile dir holding `cookies.sqlite` |
+| `KAGI_CACHE_FILE` | Path to the cookie cache file (default `<skill dir>/.kagi_cache.json`) |
 
 ## Output format
 
