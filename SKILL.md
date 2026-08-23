@@ -1,14 +1,11 @@
 ---
 name: kagi-search
 description: >-
-  Web search and related-query discovery via Kagi by reusing the logged-in
-  LibreWolf session cookie (scraped from the local browser profile). Uses the
-  same Server-Sent Events endpoint (socket/search) the Kagi web app calls, so it
-  gets full organic results without the Kagi API key, without a headless
-  browser, and without an API subscription. Pure HTTP + stdlib only. Use when
-  the user asks to search the web, wants current information/facts/docs, or
-  wants better personalization/quality than Brave. Returns title, link, snippet,
-  source, rank and related searches; also surfaces Kagi's AI "quick answer".
+  Web search via Kagi.
+  Use when the user asks to search the web, wants current information/facts/docs,
+  or wants better personalization/quality than Brave.
+  Returns title, link, snippet, source, rank and related searches;
+  also surfaces Kagi's AI "quick answer".
 ---
 
 # Kagi Search (via LibreWolf session cookie)
