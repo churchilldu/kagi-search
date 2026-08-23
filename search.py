@@ -1,175 +1,49 @@
 #!/usr/bin/env python3
 """
-kagi-search: Web search via Kagi using the logged-in LibreWolf session cookie
-(scraped from the local browser profile), rendered in a real headless LibreWolf
-so Kagi serves full results — no Kagi API key required.
+kagi-search: Web search via Kagi using the logged-in LibreWolf session cookie.
 
-Borrows CLI ergonomics from the community kagi-search/brave-search skills:
-  -n/--limit, --offset, --json, --related, output formatting.
+Pure HTTP + SSE — no headless browser, no geckodriver, no API key. It reads the
+Kagi session cookie from LibreWolf's cookies.sqlite and replays two requests the
+real web app makes:
+
+    1. GET /search?q=...            (warms up fresh cookies, validates session)
+    2. GET /socket/search?q=...&nonce=...  (Server-Sent Events -> results JSON)
+
+Stdlib only (sqlite3 + urllib). Infrastructure reverse-engineered from a HAR
+capture of a manual LibreWolf search.
 """
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
-import shutil
-import socket
+import re
+import secrets
 import sqlite3
-import subprocess
 import sys
-import tempfile
-import time
 import urllib.parse
 import urllib.request
 
-APP_NAME = "kagi-search"
-COOKIE_DOMAIN = "kagi.com"
-LIBREWOLF_DEFAULTS = {
-    "win32": r"C:\Program Files\LibreWolf\librewolf.exe",
-    "Windows": r"C:\Program Files\LibreWolf\librewolf.exe",
-    "darwin": "/Applications/LibreWolf.app/Contents/MacOS/librewolf",
-    "linux": "librewolf",
-}
+DOMAIN = "kagi.com"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 "
+      "Firefox/153.0")
 
 
-class WDError(Exception):
+class KagiError(Exception):
     pass
 
 
-class WDClient:
-    """Minimal WebDriver (Marionette) HTTP client — stdlib only."""
-
-    def __init__(self, port: int, timeout: int = 240):
-        self.base = f"http://127.0.0.1:{port}"
-        self.sid = None
-        self.timeout = timeout
-
-    def _req(self, method: str, path: str, body=None):
-        data = json.dumps(body).encode() if body is not None else b""
-        req = urllib.request.Request(
-            self.base + path, data=data, method=method,
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                raw = r.read()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as e:
-            raw = e.read()
-            try:
-                return json.loads(raw) if raw else {}
-            except Exception:
-                raise WDError(f"HTTP {e.code}: {raw[:200]!r}")
-
-    def post(self, path, body=None):
-        return self._req("POST", path, body)
-
-    def delete(self, path):
-        return self._req("DELETE", path)
-
-    def new_session(self, binary: str, extra_args: list):
-        caps = {
-            "capabilities": {
-                "alwaysMatch": {
-                    "moz:firefoxOptions": {
-                        "binary": binary,
-                        "args": ["-headless"] + extra_args,
-                    }
-                }
-            }
-        }
-        r = self.post("/session", caps)
-        v = r.get("value", {})
-        if isinstance(v, dict) and "sessionId" in v:
-            self.sid = v["sessionId"]
-            return v
-        raise WDError(f"failed to create browser session: {v}")
-
-    def navigate(self, url: str):
-        self.post(f"/session/{self.sid}/url", {"url": url})
-
-    def exec_js(self, script: str):
-        r = self.post(
-            f"/session/{self.sid}/execute/sync",
-            {"script": script, "args": []},
-        )
-        v = r.get("value")
-        if isinstance(r.get("error"), str):
-            raise WDError(f"JS error: {r.get('error')}: {r.get('message','')[:200]}")
-        return v
-
-    def add_cookie(self, name, value, domain, path, secure, http_only):
-        self.post(f"/session/{self.sid}/cookie", {
-            "cookie": {
-                "name": name, "value": value, "domain": domain, "path": path,
-                "secure": secure, "httpOnly": http_only,
-            }
-        })
-
-    def close(self):
-        if self.sid:
-            try:
-                self.delete(f"/session/{self.sid}")
-            except Exception:
-                pass
-            self.sid = None
-
-
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def find_geckodriver() -> str:
-    if os.environ.get("KAGI_GECKODRIVER"):
-        return os.environ["KAGI_GECKODRIVER"]
-    p = shutil.which("geckodriver")
-    if p:
-        return p
-    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "geckodriver.exe")
-    if os.path.exists(here):
-        return here
-    raise SystemExit(
-        "geckodriver not found.\n"
-        "  - Vendored copy is bundled at bin/geckodriver.exe\n"
-        "  - Or install it and set KAGI_GECKODRIVER / put geckodriver on PATH.\n"
-        "    Download: https://github.com/mozilla/geckodriver/releases"
-    )
-
-
-def find_librewolf() -> str:
-    if os.environ.get("KAGI_LIBREWOLF"):
-        return os.environ["KAGI_LIBREWOLF"]
-    p = shutil.which("librewolf")
-    if p:
-        return p
-    plat = sys.platform
-    if plat in LIBREWOLF_DEFAULTS and os.path.exists(LIBREWOLF_DEFAULTS[plat]):
-        return LIBREWOLF_DEFAULTS[plat]
-    candidates = []
-    la = os.environ.get("LOCALAPPDATA")
-    if la:
-        for c in ("LibreWolf", "Programs/librewolf"):
-            if os.path.exists(os.path.join(la, c, "librewolf.exe")):
-                candidates.append(os.path.join(la, c, "librewolf.exe"))
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    raise SystemExit(
-        "Could not find the LibreWolf browser.\n"
-        "  - Set KAGI_LIBREWOLF to the path of the LibreWolf binary."
-    )
-
-
+# --------------------------------------------------------------------------- #
+# profile / cookie discovery
+# --------------------------------------------------------------------------- #
 def profile_candidates() -> list:
-    """Return LibreWolf profile dirs in priority order (most likely first)."""
     if os.environ.get("KAGI_PROFILE"):
         return [os.environ["KAGI_PROFILE"]]
     appdata = os.environ.get("APPDATA", "")
     ini = os.path.join(appdata, "librewolf", "profiles.ini")
     base = os.path.join(appdata, "librewolf", "Profiles")
-    dirs = {}      # path -> is_locked
+    dirs = {}
     default_mark = None
     if os.path.exists(ini):
         with open(ini, "r", encoding="utf-8", errors="replace") as f:
@@ -188,144 +62,225 @@ def profile_candidates() -> list:
                     default_mark = os.path.basename(path)
             if sec and path:
                 dirs[os.path.basename(path)] = locked
-
-    ordered = []
-    locked = [p for p, lk in dirs.items() if lk]
-    for p in locked + [d for d in dirs if d not in locked]:
-        if default_mark and p == default_mark:
-            continue  # pushed to front below
-        ordered.append(os.path.join(base, p))
-    if default_mark:
-        # marked default goes first if it exists
-        ordered.insert(0, os.path.join(base, default_mark))
-    # de-dup, keep existing dirs
+    ordered = [p for p, _ in sorted(dirs.items(), key=lambda kv: (not kv[1]))]
+    if default_mark and default_mark in dirs:
+        ordered.insert(0, ordered.pop(ordered.index(default_mark)))
     seen, out = set(), []
     for d in ordered:
-        if d in seen:
-            continue
-        seen.add(d)
-        if os.path.isdir(d):
-            out.append(d)
+        p = os.path.join(base, d)
+        if p not in seen and os.path.isdir(p):
+            seen.add(p)
+            out.append(p)
     return out
 
 
-def cookies_db_with_session(profiles: list) -> str:
-    """Return path to a cookies.sqlite holding a valid kagi_session, or ''."""
+def load_cookies(profiles: list) -> dict:
+    """Return the Kagi cookies {name:(value,domain,path)} from a profile with
+    a valid session, or raise KagiError."""
     for profile in profiles:
         db = os.path.join(profile, "cookies.sqlite")
         if not os.path.exists(db):
             continue
         try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
-            try:
-                cur = con.execute(
-                    "SELECT length(value) FROM moz_cookies WHERE host LIKE '%kagi.com' "
-                    "AND name='kagi_session' LIMIT 1"
-                )
-                row = cur.fetchone()
-                if row and row[0] and row[0] > 20:
-                    return db
-            finally:
-                con.close()
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
         except Exception:
             continue
-    return ""
+        try:
+            rows = con.execute(
+                "SELECT host,name,value,path FROM moz_cookies "
+                "WHERE host LIKE '%kagi.com' and name='kagi_session' "
+                "   OR host LIKE '%kagi.com' and name like '_kagi_%' "
+                "   OR host LIKE '%kagi.com' and name='kagi_previous_page' "
+                "   OR host LIKE '%kagi.com' and name like 'kagi_%'"
+            ).fetchall()
+            cookies = {}
+            for host, name, value, path in rows:
+                if name not in cookies and len(value or "") > 0:
+                    cookies[name] = (value, host, path)
+            if cookies.get("kagi_session"):
+                return cookies
+        finally:
+            con.close()
+    return {}
 
 
-def load_kagi_cookies(db: str):
-    import browser_cookie3 as bc
-    return list(bc.librewolf(cookie_file=db, domain_name=COOKIE_DOMAIN))
+# --------------------------------------------------------------------------- #
+# HTTP helper
+# --------------------------------------------------------------------------- #
+def http_get(url: str, headers: dict, timeout: int = 40):
+    req = urllib.request.Request(url, headers=headers)
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    data = resp.read()
+    if resp.headers.get("Content-Encoding") == "gzip":
+        data = gzip.decompress(data)
+    return resp, data
 
 
-RESULT_JS = r"""
-var out = {qa: '', results: []};
-var qa = document.querySelector('._0_qa_reply_box');
-if (qa) out.qa = (qa.textContent || '').replace(/\s+/g, ' ').trim();
-document.querySelectorAll('div._0_SRI.search-result').forEach(function(r){
-  var t = r.querySelector('.__sri_title_link');
-  var sn = r.querySelector('.__sri-desc');
-  var title = (t ? (t.getAttribute('title') || t.textContent) : '').trim();
-  var snippet = '';
-  if (sn) {
-    var cl = sn.cloneNode(true);
-    cl.querySelectorAll('a,button,script,style').forEach(function(e){e.remove();});
-    snippet = (cl.textContent || '').replace(/\s+/g, ' ').trim();
-  }
-  out.results.push({
-    title: title,
-    url: (t && t.href) || '',
-    snippet: snippet
-  });
-});
-out.related = Array.from(document.querySelectorAll('.related-searches a')).map(function(a){return (a.textContent||'').trim();});
-return JSON.stringify(out);
-"""
+def fetch_search_html(query: str, lens: str, cookie_str: str) -> dict:
+    """GET /search — warms cookies, returns refreshed cookie dict + final status."""
+    params = urllib.parse.urlencode({"q": query, **({"lens": lens} if lens else {})})
+    url = f"https://{DOMAIN}/search?" + params
+    try:
+        resp, data = http_get(url, {
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"https://{DOMAIN}/",
+            "Cookie": cookie_str,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Upgrade-Insecure-Requests": "1",
+        }, timeout=40)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise KagiError("Kagi session rejected (HTTP %d). Log in at kagi.com in LibreWolf." % e.code)
+        raise KagiError(f"search page request failed: HTTP {e.code}")
+    if url.replace(f"https://{DOMAIN}/search", "") and "signin" in resp.geturl():
+        raise KagiError("Kagi redirected to Sign In — session expired. Log in again in LibreWolf.")
+
+    # refresh cookies from Set-Cookie headers
+    fresh = {}
+    for sc in resp.headers.get_all("Set-Cookie", []):
+        m = re.match(r"([^=]+)=([^;]*)(;|$)", sc)
+        if m and m.group(1) in ("kagi_session", "_kagi_search_", "kagi_previous_page"):
+            fresh[m.group(1)] = m.group(2)
+    return {"html": data, "refresh": fresh, "params": params}
+
+
+def fetch_socket(query: str, lens: str, cookie_str: str, session: str) -> str:
+    """GET /socket/search — SSE stream of results JSON. Returns raw stream text."""
+    params = urllib.parse.urlencode({"q": query, **({"lens": lens} if lens else {})})
+    nonce = secrets.token_hex(16)
+    url = f"https://{DOMAIN}/socket/search?{params}&nonce={nonce}"
+    try:
+        resp, data = http_get(url, {
+            "User-Agent": UA,
+            "Accept": "text/event-stream",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"https://{DOMAIN}/search?{params}",
+            "Cookie": cookie_str,
+            "X-Kagi-Authorization": session,
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Priority": "u=4",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }, timeout=60)
+    except urllib.error.HTTPError as e:
+        raise KagiError(f"socket request failed: HTTP {e.code}")
+    return data.decode("utf-8", "replace")
+
+
+# --------------------------------------------------------------------------- #
+# SSE parsing
+# --------------------------------------------------------------------------- #
+def parse_sse(stream: str) -> dict:
+    payloads = {}
+    buffer = ""
+    for line in stream.split("\n"):
+        if line.startswith("data: "):
+            buffer += line[6:]
+        elif line == "" and buffer:
+            try:
+                arr = json.loads(buffer)
+                for item in arr:
+                    if isinstance(item, dict) and "tag" in item:
+                        payloads.setdefault(item["tag"], []).append(item["payload"])
+            except Exception:
+                pass
+            buffer = ""
+    return payloads
+
+
+def strip_html(s: str) -> str:
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def parse_related(html: str):
+    spans = re.findall(r"<span>(.*?)</span>", html or "", re.S)
+    return [strip_html(s) for s in spans if strip_html(s)]
 
 
 def run_search(query: str, limit: int, lens: str, with_related: bool) -> dict:
-    db = cookies_db_with_session(profile_candidates())
-    if not db:
-        raise SystemExit(
-            "No LibreWolf profile with a Kagi login found.\n"
-            "  - Log in at https://kagi.com in LibreWolf first, then retry.\n"
-            "  - Or point KAGI_PROFILE at the profile directory holding your Kagi cookies."
-        )
-    cookies = load_kagi_cookies(db)
+    cookies = load_cookies(profile_candidates())
     if not cookies:
-        raise SystemExit("No Kagi cookies read from profile.")
+        raise KagiError(
+            "No LibreWolf profile with a Kagi login found.\n"
+            "  - Log in at https://kagi.com in LibreWolf, then retry.\n"
+            "  - Or set KAGI_PROFILE to the profile dir holding your Kagi cookies."
+        )
+    session = cookies["kagi_session"][0]
+    old_search = cookies.get("_kagi_search_", ("", None, None))[0]
+    base_cookie = f"kagi_session={session}"
+    if old_search:
+        base_cookie = f"_kagi_search_={old_search}; {base_cookie}"
 
-    gecko = find_geckodriver()
-    binary = find_librewolf()
-    port = free_port()
+    # 1) warm up + refresh cookies (also validates the session)
+    warm = fetch_search_html(query, lens, base_cookie)
+    ref = warm["refresh"]
+    now = ref.get("kagi_session", session)
+    now_search = ref.get("_kagi_search_", old_search)
+    cookie_now = f"kagi_session={now}"
+    if now_search:
+        cookie_now = f"_kagi_search_={now_search}; {cookie_now}"
+    # prefer refreshed session if the server issued one
+    session = now
 
-    gkm = subprocess.Popen(
-        [gecko, "--port", str(port)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    wd = WDClient(port)
-    try:
-        time.sleep(1.5)
-        wd.new_session(binary, [])
-        # 1) land on kagi.com so cookies can be set for that domain
-        wd.navigate("https://kagi.com/")
-        time.sleep(4)
-        for c in cookies:
-            if c.name == "translate_custom_css_enabled":
-                continue
-            wd.add_cookie(c.name, c.value, c.domain, c.path,
-                          bool(c.secure), True)
-        # 2) run the search
-        params = {"q": query}
-        if lens:
-            params["lens"] = lens
-        url = "https://kagi.com/search?" + urllib.parse.urlencode(params)
-        wd.navigate(url)
-        time.sleep(8)
-        raw = wd.exec_js("return document.title;")
-        if "Sign In" in (raw or "") and "Kagi" not in (raw or ""):
-            raise SystemExit("Kagi redirected to Sign In — your session cookie may be expired. Log in again in LibreWolf.")
-        data = json.loads(wd.exec_js(RESULT_JS))
-    finally:
-        wd.close()
-        gkm.terminate()
+    # 2) SSE results
+    stream = fetch_socket(query, lens, cookie_now, session)
+    payloads = parse_sse(stream)
+
+    items = []
+    answer_box = None
+    quick = ""
+    for payload in payloads.get("search_results_json", []):
         try:
-            gkm.wait(timeout=5)
+            p = json.loads(payload)
         except Exception:
-            gkm.kill()
+            continue
+        items = p.get("items") or items
+        answer_box = p.get("answer_box") or answer_box
+    for payload in payloads.get("top_content", []):
+        if not isinstance(payload, str):
+            continue
+        m = re.search(r"_0_qa_reply_box\">(.*?)</div>", payload, re.S)
+        if m:
+            quick = strip_html(m.group(1))
 
-    data["results"] = (data.get("results") or [])[:limit]
-    if not with_related:
-        data.pop("related", None)
-    data["query"] = query
-    return data
+    results = []
+    for it in items or []:
+        results.append({
+            "title": it.get("title", ""),
+            "url": it.get("url", ""),
+            "snippet": (it.get("snippet") or "").strip(),
+            "source": it.get("source", ""),
+            "rank": it.get("rank", 0),
+        })
+    out = {
+        "query": query,
+        "results": results[:limit],
+        "quick": quick,
+        "answer_box": answer_box,
+        "related": parse_related(
+            payloads.get("related_searches", [None])[0]
+            if with_related and payloads.get("related_searches")
+            else ""
+        ),
+    }
+    return out
 
 
-def render_markdown(data: dict, with_summary: bool) -> str:
+# --------------------------------------------------------------------------- #
+# output
+# --------------------------------------------------------------------------- #
+def render_markdown(data: dict, with_quick: bool) -> str:
     lines = []
-    qa = data.get("qa") or ""
-    if qa and with_summary:
+    if with_quick and data.get("quick"):
         lines.append("## Quick Answer")
-        lines.append(qa)
+        lines.append(data["quick"])
         lines.append("")
     for i, r in enumerate(data.get("results") or [], 1):
         lines.append(f"--- Result {i} ---")
@@ -333,36 +288,43 @@ def render_markdown(data: dict, with_summary: bool) -> str:
         lines.append(f"Link: {r['url']}")
         if r.get("snippet"):
             lines.append(f"Snippet: {r['snippet']}")
+        if r.get("source"):
+            lines.append(f"Source: {r['source']}")
         lines.append("")
-    related = [x for x in (data.get("related") or []) if x]
-    if related:
+    rel = [x for x in (data.get("related") or []) if x]
+    if rel:
         lines.append("## Related searches")
-        for r in related:
-            lines.append(f"- {r}")
+        lines.append("\n".join(f"- {r}" for r in rel))
     return "\n".join(lines).rstrip()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Kagi web search using your LibreWolf login cookie (no API key).")
+    ap = argparse.ArgumentParser(description="Kagi web search via your LibreWolf login cookie (pure HTTP, no API key).")
     ap.add_argument("query", nargs="?", help="search query")
     ap.add_argument("-n", "--limit", type=int, default=10, help="max results (default 10)")
+    ap.add_argument("--offset", type=int, default=0, help="skip this many results")
     ap.add_argument("--lens", default="", help="Kagi lens, e.g. code, videos, news, forums, academic")
-    ap.add_argument("--offset", type=int, default=0, help="unused placeholder for compatibility")
     ap.add_argument("--json", action="store_true", help="output JSON")
     ap.add_argument("--no-related", action="store_true", help="hide related searches")
     ap.add_argument("--no-quick", action="store_true", help="omit the quick answer block")
-    ap.add_argument("--summary", action="store_true", help="include the Kagi quick answer as a summary")
     args = ap.parse_args()
-
     if not args.query:
         ap.print_help()
         sys.exit(1)
 
-    data = run_search(args.query, args.limit, args.lens, not args.no_related)
+    with_related = not args.no_related
+    with_quick = not args.no_quick
+    try:
+        data = run_search(args.query, args.offset + args.limit, args.lens, with_related)
+        data["results"] = data["results"][args.offset:]
+    except KagiError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     if args.json:
         print(json.dumps(data, ensure_ascii=False, indent=2))
     else:
-        print(render_markdown(data, with_summary=args.summary or not args.no_quick))
+        print(render_markdown(data, with_quick))
 
 
 if __name__ == "__main__":

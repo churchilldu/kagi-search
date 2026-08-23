@@ -1,64 +1,84 @@
 # Implementation notes
 
-## Why cookie interception + real browser (not the API)
+## How the no-API, no-browser approach works
 
-- **Kagi's paid Search API** requires a subscriber API token (`KAGI_API_KEY`)
-  and is currently in beta. This skill deliberately avoids it by reusing the
-  user's logged-in browser session.
-- **Plain HTTP scraping fails.** Testing showed that `GET /search?q=...` with
-  the `kagi_session` cookie via urllib/httpx returns only Kagi's app shell —
-  ~23 anchors, no organic results. Kagi renders organic results for real
-  browser requests and serves an empty shell to non-browser requests (client
-  render + anti-bot). There is **no** separate results JSON endpoint in
-  `k_serp.js`/`k_sea.js`; the DOM is server-rendered only when the request
-  looks like a real browser.
-- **Solution:** drive real (headless) LibreWolf with the user's cookies via
-  geckodriver → full results every time.
+Kagi's web app loads results **client-side**. The `/search?q=...` HTML response
+is just an app shell; the actual results arrive over a **Server-Sent Events
+(SSE)** stream from:
 
-## Cookie storage in LibreWolf
+```
+GET https://kagi.com/socket/search?q=<query>&nonce=<32-hex>
+```
 
-- Profile: `%APPDATA%\librewolf\Profiles\<profile>\cookies.sqlite`
-- Active profile found via `%APPDATA%\librewolf\profiles.ini` (prefers the
-  `[Install...] Locked=1` default, else `Default=1`).
-- Kagi cookies (table `moz_cookies`):
-  - `.kagi.com` → `kagi_session` (auth; ~55 chars)
-  - `kagi.com` → `_kagi_search_`, `kagi_previous_page`
-- Values are stored in plaintext (no key4 decryption needed for cookies).
-- Read-only access via `sqlite3.connect("file:...?mode=ro")`; the profile is
-  never modified even if LibreWolf is running.
+Reverse-engineered from a HAR capture of a manual LibreWolf search. Two plain
+requests are enough — no headless browser, no geckodriver, no API key.
 
-## Headless flow (search.py)
+## Request 1 — warm up + validate
 
-1. Locate profile → pick `cookies.sqlite` containing a `kagi_session`.
-2. `browser_cookie3.librewolf(cookie_file=..., domain_name='kagi.com')` → jar.
-3. Start geckodriver on a free port; POST `/session` with
-   `moz:firefoxOptions.binary` = LibreWolf and `args:["-headless"]`.
-4. **Navigate to `https://kagi.com/` first** — WebDriver refuses cookie
-   injection while the document is `about:blank` ("Document is cookie-averse").
-5. `POST /session/{id}/cookie` for each kagi cookie (body must be wrapped as
-   `{"cookie": {...}}`).
-6. `POST /session/{id}/url` to `https://kagi.com/search?q=...&lens=...`.
-7. `GET /session/{id}/execute/sync` runs extraction JS returning JSON.
-8. Tear down: `DELETE /session/{id}`, terminate geckodriver.
+```
+GET https://kagi.com/search?q=...&lens=...
+Cookie: _kagi_search_=<old>; kagi_session=<session>
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0
+Accept: text/html,...
+Referer: https://kagi.com/
+Sec-Fetch-*: document / navigate / same-origin
+```
+- Hard requirement: a **real Firefox/LibreWolf User-Agent** — a generic
+  `python-requests` UA returns the empty shell instead of a valid session.
+- Response sets fresh `kagi_session` / `_kagi_search_` cookies (parse the
+  `Set-Cookie` headers into a fresh cookie string for request 2).
+- A redirect to `/signin` means the session expired → tell the user to log in.
 
-## Result DOM (subject to Kagi's markup changes)
+## Request 2 — the results stream
 
-- Result item: `div._0_SRI.search-result`
-- Title/href: `a.__sri_title_link` (prefer its `title` attribute for the full
-  title; falls back to text)
-- Snippet: `div.__sri-desc` (text, collapsed to single spaces)
-- Quick answer (AI free summary): `div._0_qa_reply_box`
-- Related searches: `.related-searches a`
+```
+GET https://kagi.com/socket/search?q=...&lens=...&nonce=614e...12ab
+Cookie: _kagi_search_=<fresh>; kagi_session=<session>
+X-Kagi-Authorization: <session>          # = kagi_session value (also sent as header!)
+Accept: text/event-stream
+Referer: https://kagi.com/search?q=...
+Sec-Fetch-*: empty / cors / same-origin
+Cache-Control: no-cache
+```
+- `X-Kagi-Authorization` **equals the `kagi_session` cookie value** — this is the
+  auth token for the API-style socket endpoint.
+- `nonce` is a fresh random 32-hex `secrets.token_hex(16)`.
+- Response is SSE: `data: [{"tag":"...","payload":"..."}]` blocks separated by
+  blank lines, ending with `id: CLOSE`.
 
-Keep `RESULT_JS` in `search.py` as the single source of truth for selectors so
-markup changes are easy to patch.
+## SSE tags (payload is a JSON array of `{tag,payload}`)
 
-## Known limits / future work
+| tag | payload | use |
+|-----|---------|-----|
+| `search_results_json` | JSON string: `{"items":[{title,url,snippet,source,rank}], "answer_box":...}` | **the results** |
+| `top_content` | HTML fragment (may be a JSON/dict for some lenses) | optional AI "quick answer" in `_0_qa_reply_box` |
+| `related_searches` | HTML `<div class="related-searches">` with `<a href="?q=..."><span>text</span>` | related query suggestions |
+| `domain_info`, `search` | misc | not currently used |
 
-- Results are capped to what fits on Kagi page 1 (typical ~15). Pagination is
-  a JS-SPA feature with no stable URL param; not yet wired in. `--offset` is a
-  compatibility placeholder.
-- `geckodriver` bundled here is Windows x64 — ship per-platform binary or rely
-  on PATH.
-- First run of a fresh headless profile may be a bit slower (~10–15s) due to
-  browser bootstrap + JS render; an 8s render settle is currently hardcoded.
+Returns up to ~60 items per stream (page-1 volume), so `-n`/`--offset` slice
+locally — pagination needs no extra request.
+
+## Cookie source
+
+- LibreWolf stores cookies in `%APPDATA%\librewolf\Profiles\<profile>\cookies.sqlite`.
+- Active profile resolved from `%APPDATA%\librewolf\profiles.ini` (prefers the
+  `[Install...] Locked=1` default, else `Default=1`); scan candidates for one
+  that actually holds a `kagi_session`.
+- Read via `sqlite3.connect("file:...?mode=ro")` — profile is never modified,
+  even if LibreWolf is running.
+- Cookies are plaintext; no key4 decryption needed for cookie values.
+
+## Why not the earlier headless-browser version?
+
+An earlier version drove headless LibreWolf via geckodriver to let Kagi render.
+It worked but added a ~4 MB binary + `browser_cookie3` dependency. The SSE
+endpoint makes pure HTTP possible, which is faster, lighter, and stdlib-only.
+Reach for JSON-mode (`--json`) if you need the raw item objects downstream.
+
+## Payload fragility warning
+
+Kagi's markup/tags can change. Selectors and SSE tag names and item keys are
+centralized in `search.py` (`parse_sse`, `run_search`) so a future shim is a
+single-point fix. If the API-hostile `socket/search` endpoint ever disappears,
+re-adding the headless-LibreWolf renderer (`references/` has the WebDriver
+recipe) is the fallback.

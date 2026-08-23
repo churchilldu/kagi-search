@@ -1,38 +1,34 @@
 # kagi-search (pi skill)
 
-Search **Kagi** using your **logged-in LibreWolf session cookie** — rendered in a
-real headless LibreWolf and extracted. No Kagi API key, no API subscription.
-
-See [`SKILL.md`](SKILL.md) for usage, or just run:
+Search **Kagi** using your **logged-in LibreWolf session cookie** — pure HTTP +
+SSE, stdlib only. No Kagi API key, no API subscription, no headless browser.
 
 ```bash
-pip install -r requirements.txt
 python search.py "pi coding agent" -n 5
-python search.py "github actions setup-python" --json
-python search.py "web frameworks 2025" --lens code
+python search.py "consensus algorithms" --lens programming --json
+python search.py "web frameworks 2025" --offset 10
 ```
 
 ## How it works
-1. Reads `kagi_session` (+ friends) from LibreWolf's `cookies.sqlite`.
-2. Launches **headless LibreWolf** via `geckodriver` and injects those cookies.
-3. Runs the search, waits for render, extracts title / URL / snippet / related
-   searches (and the free AI quick answer).
+Reads `kagi_session` from LibreWolf's `cookies.sqlite` and replays the same two
+requests the Kagi web app makes:
+1. `GET /search?q=...` — warms cookies / validates the session.
+2. `GET /socket/search?q=...&nonce=...` — Server-Sent Events → results JSON.
 
-A plain HTTP request with the cookie returns an empty shell, so this drives the
-real browser to get full results.
+Reverse-engineered from an HAR capture of a manual search; verified live. No
+dependencies beyond the Python standard library.
 
 ## Layout
-- `search.py` — the CLI (cookie → headless browser → results)
-- `bin/geckodriver.exe` — vendored geckodriver (Windows x64)
+- `search.py` — the CLI (cookie → HTTP → SSE → results)
 - `SKILL.md` — the pi skill manifest/instructions
-- `references/implementation.md` — deep technical notes
+- `references/implementation.md` — technical notes & SSE schema
 
 ## Requirements
 - LibreWolf (logged into Kagi)
-- Python 3.8+ and `pip install -r requirements.txt`
+- Python 3.8+
 
 ## Env overrides
-`KAGI_LIBREWOLF`, `KAGI_GECKODRIVER`, `KAGI_PROFILE` — see SKILL.md.
+`KAGI_PROFILE` — profile dir holding `cookies.sqlite` (auto-detected otherwise).
 
 ## License
-MIT (MIT-style; see LICENSE).
+MIT.
