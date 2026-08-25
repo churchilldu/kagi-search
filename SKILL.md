@@ -8,9 +8,9 @@ description: >-
   also surfaces Kagi's AI "quick answer".
 ---
 
-# Kagi Search (via LibreWolf session cookie)
+# Kagi Search
 
-Search Kagi with your **existing logged-in LibreWolf profile** — no Kagi API key,
+Search Kagi with your existing logged-in LibreWolf profile — no Kagi API key,
 no headless browser, no HTTP library. It reads the Kagi session cookie from
 LibreWolf's `cookies.sqlite` and replays the two requests the web app itself
 makes:
@@ -25,8 +25,8 @@ delivers full organic results with your personalization — zero dependencies.
 
 ## Requirements
 
-- LibreWolf installed, **logged in** to Kagi.
-- Python 3.8+. **No third-party packages** (uses `sqlite3` + `urllib` only).
+- LibreWolf installed, logged in to Kagi.
+- Python 3.8+. No third-party packages (uses `sqlite3` + `urllib` only).
 
 ## Usage
 
@@ -81,9 +81,9 @@ Source: pi.dev
 
 ## Notes & troubleshooting
 
-- If you get a **"Sign In"** / "session rejected" error, your Kagi session
+- If you get a "Sign In" / "session rejected" error, your Kagi session
   expired — log in at `https://kagi.com` in LibreWolf and retry.
-- Your profile is **read-only**: reads `cookies.sqlite` (mode=ro) and never
+- Your profile is read-only: reads `cookies.sqlite` (mode=ro) and never
   modifies it, even while LibreWolf is running.
 - Returns up to ~60 results per query (fit on Kagi's page 1); trim with `-n` or
   paginate with `--offset`.

@@ -1,6 +1,6 @@
-# kagi-search (pi skill)
+# kagi-search
 
-Search **Kagi** using your **logged-in LibreWolf session cookie** — pure HTTP +
+Search Kagi using your logged-in LibreWolf session cookie — pure HTTP +
 SSE, stdlib only. No Kagi API key, no API subscription, no headless browser.
 
 ```bash
