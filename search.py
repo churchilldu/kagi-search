@@ -26,6 +26,16 @@ import time
 import urllib.parse
 import urllib.request
 
+# Windows defaults stdout to cp1252, which cannot encode arbitrary Unicode in
+# search results (snippets, titles) and crashes with UnicodeEncodeError.
+# Force UTF-8 (best effort) so the script works no matter how it is invoked.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 DOMAIN = "kagi.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 "
       "Firefox/153.0")
