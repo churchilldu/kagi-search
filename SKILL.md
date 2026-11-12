@@ -11,7 +11,7 @@ description: >-
 # Kagi Search
 
 Search Kagi with your existing logged-in LibreWolf profile — no Kagi API key,
-no headless browser, no HTTP library. It reads the Kagi session cookie from
+no headless browser, no third-party HTTP library. It reads the Kagi session cookie from
 LibreWolf's `cookies.sqlite` and replays the two requests the web app itself
 makes:
 
