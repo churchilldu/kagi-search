@@ -10,10 +10,10 @@ description: >-
 
 # Kagi Search
 
-Search Kagi with your existing logged-in LibreWolf profile — no Kagi API key,
-no headless browser, no third-party HTTP library. It reads the Kagi session cookie from
-LibreWolf's `cookies.sqlite` and replays the two requests the web app itself
-makes:
+Search Kagi with your existing logged-in browser session — no Kagi API key, no
+headless browser. It reads the Kagi session cookie from your browser (via
+`browser_cookie3`: LibreWolf, Firefox, Chrome, Edge, Brave, Chromium, Vivaldi,
+Opera, Safari) and replays the two requests the web app itself makes:
 
 1. `GET /search?q=...` — warms up fresh cookies / validates the session.
 2. `GET /socket/search?q=...&nonce=...` — a Server-Sent Events stream carrying
@@ -21,12 +21,12 @@ makes:
    searches, and the AI quick answer.
 
 Yes, it is scraper-flavoured (session reuse instead of the paid API), but it
-delivers full organic results with your personalization — zero dependencies.
+delivers full organic results with your personalization.
 
 ## Requirements
 
-- LibreWolf installed, logged in to Kagi.
-- Python 3.8+. No third-party packages (uses `sqlite3` + `urllib` only).
+- Any browser you are logged into Kagi with (LibreWolf is the default first pick).
+- Python 3.8+ and `browser-cookie3` (`pip install --user browser-cookie3`).
 
 ## Usage
 
@@ -38,7 +38,8 @@ python search.py "query" --lens code            # Kagi lens (code, videos, news,
 python search.py "query" --json                 # machine-readable output
 python search.py "query" --no-quick             # omit AI quick answer
 python search.py "query" --no-related           # hide related searches
-python search.py "query" --no-cache             # ignore cached cookie, re-read profile
+python search.py "query" --browser chrome       # read cookies from one browser only
+python search.py "query" --no-cache             # ignore cached cookie, re-read the browser
 ```
 
 From pi, invoke it through this skill (the agent runs `search.py` for you).
@@ -47,16 +48,17 @@ From pi, invoke it through this skill (the agent runs `search.py` for you).
 
 The Kagi session cookie is cached to `.kagi_cache.json` in the skill directory.
 On each run the cache is used if it exists and hasn't expired; otherwise the
-session is re-read from your LibreWolf profile and the cache is refreshed.
+session is re-read from your browser and the cache is refreshed.
 Cached cookies are re-validated/rotated by the warm-up `/search` request every
-run, and `--no-cache` forces a fresh profile read. (Cache file is git-ignored
+run, and `--no-cache` forces a fresh browser read. (Cache file is git-ignored
 — it contains a session secret.)
 
 ## Environment overrides
 
 | Variable | Meaning |
 |----------|---------|
-| `KAGI_PROFILE` | Path to the LibreWolf profile dir holding `cookies.sqlite` |
+| `KAGI_BROWSER` | Read cookies from this browser only (`chrome`, `firefox`, ...) |
+| `KAGI_PROFILE` | Path to a Firefox/LibreWolf profile dir holding `cookies.sqlite` |
 | `KAGI_CACHE_FILE` | Path to the cookie cache file (default `<skill dir>/.kagi_cache.json`) |
 
 ## Output format
@@ -82,8 +84,12 @@ Source: pi.dev
 ## Notes & troubleshooting
 
 - If you get a "Sign In" / "session rejected" error, your Kagi session
-  expired — log in at `https://kagi.com` in LibreWolf and retry.
-- Your profile is read-only: reads `cookies.sqlite` (mode=ro) and never
-  modifies it, even while LibreWolf is running.
+  expired — log in at `https://kagi.com` in your browser and retry.
+- "No Kagi session cookie found" lists every browser it probed with the reason
+  (e.g. Chrome's `Unable to get key for cookie decryption`) — use `--browser`
+  to pin a working one, or `KAGI_PROFILE` for an unusual Firefox/LibreWolf
+  profile location.
+- Your browser profile is never modified: cookie databases are copied (or read
+  read-only) by the library, so it works while the browser is running.
 - Returns up to ~60 results per query (fit on Kagi's page 1); trim with `-n` or
   paginate with `--offset`.

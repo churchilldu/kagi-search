@@ -60,29 +60,41 @@ locally — pagination needs no extra request.
 
 ## Cookie source + caching
 
-- LibreWolf stores cookies in `%APPDATA%\librewolf\Profiles\<profile>\cookies.sqlite`.
-- Active profile resolved from `%APPDATA%\librewolf\profiles.ini` (prefers the
-  `[Install...] Locked=1` default, else `Default=1`); scan candidates for one
-  that actually holds a `kagi_session`.
-- Read via `sqlite3.connect("file:...?mode=ro")` — profile is never modified,
-  even if LibreWolf is running.
-- Cookies are plaintext; no key4 decryption needed for cookie values.
+- Cookies come from `browser_cookie3`, so the tool works with whatever browser
+  you are logged into Kagi with: LibreWolf, Firefox, Chrome, Edge, Brave,
+  Chromium, Vivaldi, Opera, Safari. Order is `BROWSER_ORDER` in `search.py`
+  (LibreWolf/Firefox first: Kagi cookies are plaintext there, no key
+  decryption), and the first browser holding a `kagi_session` wins.
+- Browsers are probed with `domain_name="kagi.com"`; results are filtered to
+  `kagi_session`, `_kagi_search_`, `kagi_previous_page`.
+- The library handles the platform-specific mess: copying the cookie DB out
+  from under a running browser, VSS shadow copies for locked Chrome DBs,
+  DPAPI/`Local State` key decryption for Chromium v80+, and recovery of
+  session cookies from `sessionstore` for Firefox-based browsers. The profile
+  is never modified, so it works while the browser is open.
+- `KAGI_BROWSER` pins one browser; `KAGI_PROFILE` supplies an explicit
+  Firefox/LibreWolf profile dir (passed as `cookie_file`).
+- When nothing yields a session, the error lists every browser tried with the
+  failure reason (e.g. `chrome: BrowserCookieError: Unable to get key for
+  cookie decryption`) so decryption problems are diagnosable.
 
 ### Cache (`<skill dir>/.kagi_cache.json`)
 
 The Kagi cookies (`kagi_session`, `_kagi_search_`, `kagi_previous_page`) are
-cached to a JSON file in the skill dir to avoid scanning the profile every run:
+cached to a JSON file in the skill dir to avoid reading browser stores every
+run:
 
 - `read_cookie_cache()` returns the cached `{name:value}` map only if
   `expires_at` > now (or the file does not exist) — else `{}`.
-- `load_cookies(profiles, use_cache)` → cache hit, or fall back to
-  `_sqlite_cookies()` and `write_cookie_cache()`.
-- `expires_at` derives from `moz_cookies.expiry` (ms→s); when the cookie has no
-  real expiry (session cookie → `expiry == 0`), falls back to
+- `load_cookies(use_cache)` → cache hit, or fall back to
+  `read_browser_cookies()` and `write_cookie_cache()`.
+- `expires_at` comes from the cookie's own expiry via `_expiry_seconds()`,
+  which normalizes Firefox's millisecond `moz_cookies.expiry` values; when the
+  cookie has no real expiry (session cookie), falls back to
   `DEFAULT_TTL_SECONDS` (6 h).
 - The warm-up `/search` response's fresh `Set-Cookie` values are written back
   to the cache each run, so the cached session stays current.
-- `--no-cache` bypasses the cache (force profile read). Cache writes are
+- `--no-cache` bypasses the cache (force a browser read). Cache writes are
   best-effort and atomic (`os.replace` of a `.tmp`), and the file is
   git-ignored because it holds a session secret. Override the path with
   `KAGI_CACHE_FILE`.
@@ -90,9 +102,10 @@ cached to a JSON file in the skill dir to avoid scanning the profile every run:
 ## Why not the earlier headless-browser version?
 
 An earlier version drove headless LibreWolf via geckodriver to let Kagi render.
-It worked but added a ~4 MB binary + `browser_cookie3` dependency. The SSE
-endpoint makes pure HTTP possible, which is faster, lighter, and stdlib-only.
-Reach for JSON-mode (`--json`) if you need the raw item objects downstream.
+It worked but added a ~4 MB browser binary plus WebDriver plumbing. The SSE
+endpoint makes pure HTTP possible, which is faster, lighter, and needs only
+`browser_cookie3` for the cookie hand-off. Reach for JSON-mode (`--json`) if
+you need the raw item objects downstream.
 
 ## Payload fragility warning
 
